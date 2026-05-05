@@ -5,19 +5,59 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 import os
+import json
+import secrets
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+
+def load_teacher_credentials() -> dict:
+    credentials_file = current_dir / "teachers.json"
+    if not credentials_file.exists():
+        return {}
+
+    with credentials_file.open("r", encoding="utf-8") as file:
+        data = json.load(file)
+
+    if not isinstance(data, dict):
+        return {}
+
+    teachers = data.get("teachers", {})
+    if not isinstance(teachers, dict):
+        return {}
+
+    return teachers
+
+
+TEACHER_CREDENTIALS = load_teacher_credentials()
+ACTIVE_TEACHER_SESSIONS = {}
+
+
+def validate_teacher_session(token: str | None) -> str:
+    if not token or token not in ACTIVE_TEACHER_SESSIONS:
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher login required"
+        )
+
+    return ACTIVE_TEACHER_SESSIONS[token]
 
 # In-memory activity database
 activities = {
@@ -88,9 +128,39 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def teacher_login(payload: LoginRequest):
+    expected_password = TEACHER_CREDENTIALS.get(payload.username)
+    if not expected_password or expected_password != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(32)
+    ACTIVE_TEACHER_SESSIONS[token] = payload.username
+    return {
+        "message": f"Logged in as {payload.username}",
+        "token": token,
+        "username": payload.username,
+    }
+
+
+@app.post("/auth/logout")
+def teacher_logout(x_teacher_token: str | None = Header(default=None)):
+    if not x_teacher_token:
+        raise HTTPException(status_code=401, detail="Teacher login required")
+
+    ACTIVE_TEACHER_SESSIONS.pop(x_teacher_token, None)
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    x_teacher_token: str | None = Header(default=None)
+):
     """Sign up a student for an activity"""
+    teacher_username = validate_teacher_session(x_teacher_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -107,12 +177,20 @@ def signup_for_activity(activity_name: str, email: str):
 
     # Add student
     activity["participants"].append(email)
-    return {"message": f"Signed up {email} for {activity_name}"}
+    return {
+        "message": f"{teacher_username} registered {email} for {activity_name}"
+    }
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    x_teacher_token: str | None = Header(default=None)
+):
     """Unregister a student from an activity"""
+    teacher_username = validate_teacher_session(x_teacher_token)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -129,4 +207,6 @@ def unregister_from_activity(activity_name: str, email: str):
 
     # Remove student
     activity["participants"].remove(email)
-    return {"message": f"Unregistered {email} from {activity_name}"}
+    return {
+        "message": f"{teacher_username} unregistered {email} from {activity_name}"
+    }
